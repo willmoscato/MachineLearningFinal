@@ -1,0 +1,884 @@
+---
+title: "Using Machine Learning to Classify Baseball Pitches by Pitch Type"
+author: "Jake Greenberg, Will Moscato, and Michael Helton"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r, echo=FALSE, message = FALSE}
+#plotting and exploring
+library(tidyverse) #for plotting and summarizing
+library(GGally) #for nice scatterplot matrix 
+library(ggridges) #for joy/ridge plots
+library(corrplot) #for basic correlation matrix plot
+library(naniar) #for exploring missing values
+library(pdp) #for partial dependence plots, MARS models
+library(rpart.plot) #for plotting decision trees
+library(vip) #for importance plots
+
+#making things look nice
+library(lubridate) #for nice dates
+library(knitr) #for nice tables
+library(scales) #for nice labels on graphs
+library(gridExtra) #for arranging plots
+library(broom) #for nice model output
+library(janitor) #for nice names
+
+#data
+library(ISLR) #for data
+library(moderndive) #for data
+
+#modeling
+library(rsample) #for splitting data
+library(recipes) #for keeping track of transformations
+library(caret) #for modeling
+library(leaps) #for variable selection
+library(glmnet) #for LASSO
+library(earth) #for MARS models
+library(rpart) #for decision trees
+library(randomForest) #for bagging and random forests
+library(kableExtra)
+library(formattable)
+theme_set(theme_minimal())
+```
+
+# **Research Question(s):**
+#### 1. What is the best way to classify pitches by pitch type and what are the most influential variables in determining pitch type?
+
+#### 2. Is there a reliable way to use these findings to classify/predict pitches in real time?
+
+```{r, echo= FALSE, warning = FALSE, message= FALSE}
+may_17_pitch <- read_csv("May_1-7_pitch.csv")
+may_8.14_pitch <- read_csv("May_8-14_pitch.csv")
+may_15.21_pitch <- read_csv("May_15-21_pitch.csv")
+may_22.28_pitch <- read_csv("May_22-28_pitch.csv")
+may_29.31_pitch_nofilter <- read_csv("May_29-31_pitch_nofilter.csv")
+```
+
+```{r, echo= FALSE, message= FALSE, warning = FALSE}
+may_all <- rbind(may_17_pitch, may_8.14_pitch, may_15.21_pitch, may_22.28_pitch, may_29.31_pitch_nofilter) 
+```
+
+```{r, echo= FALSE, message = FALSE, warning= FALSE}
+may_all_cleaned <- may_all  %>% 
+  select(pitch_type, pitch_name, release_speed, release_pos_x, release_pos_z, release_pos_y, player_name, p_throws, pfx_x, pfx_z, release_spin_rate, release_extension, home_score, away_score, plate_x, plate_z, stand) %>% 
+  mutate(release_spin_rate = as.numeric(release_spin_rate)) %>% 
+  filter(pitch_type != "EP", release_pos_z < 8, !player_name %in% c("Chris Owings", "Hernan Perez", "Victor Caratini", "Brandon Dixon", "John Ryan Murphy", "Luke Maile", "Kevin Plawecki", "Tyler White", "Pat Venditte", "Ryan Feierabend", "Charlie Culberson","Tom Murphy", "Pablo Sandoval"), release_speed > 60)
+may_all_cleaned <- na.omit(may_all_cleaned)
+may_all_cleaned$pitch_type[may_all_cleaned$pitch_type == "KC"] <- "CU"
+may_all_cleaned$pitch_type[may_all_cleaned$pitch_type == "SI"] <- "FT"
+may_all_cleaned$pitch_name[may_all_cleaned$pitch_name == "Knuckle Curve"] <- "Curveball"
+may_all_cleaned$pitch_name[may_all_cleaned$pitch_name == "Sinker"] <- "2-Seam Fastball"
+
+may_all_cleaned_l <- may_all_cleaned %>% 
+  filter(p_throws == "L")
+may_all_cleaned_r <- may_all_cleaned %>% 
+  filter(p_throws == "R")
+```
+
+# **Data Collection**
+
+#### All of our data was collected using the BaseballSavant search tool, filtering all pitches thrown in the MLB in May 2019. The unit of observation within the dataset are individual pitches. All data from within the dataset measures different characteristics for each pitch using TrackMan devices at each MLB stadium. We opted to only look at data from May because we hypothesized that this month would have the highest percentage of "crucial pitchers" on teams' rosters being healthy and active, due to the fact that the season is just getting underway. We only use one month's worth of data because this dataset is extremely large, so our computers have insufficient computing power to handle a larger dataset.
+
+# **Plan for Modeling**
+
+#### In this study, we will attempt to predict the pitch type of each pitch thrown in the MLB during May 2019 using a variety of techniques. We begin by clustering pitches using the variables that are visible to the naked eye to exhibit the necessity for modeling that can process more variables in determining pitch type. We then examing exploratory plots that show different elements of the dataset. Next, we split the dataset by pitcher handedness and further divided each dataset (one for Left-Handed Pitchers and one for Right-Handed Pitchers) into training (70 % of observations) and test data (30 % of observations) we attempt to predict pitch types using Decision Trees, K-Nearest Neighbor Modeling, and Random Forest Modeling. Finally, we apply the models to test data to determine which one is the most accurate and suitable for accomplishing our goal. Lastly, we apply the model to real pitches to simulate its real-time predictive capabilities.  
+
+
+# **Data Cleaning**
+#### In the data cleaning portion, we select 17 variables to keep: pitch_type, pitch_name, release_speed, release_pos_x, release_pos_z, release_pos_y, player_name, p_throws, pfx_x, pfx_z, release_spin_rate, release_extension, home_score, away_score, plate_x, plate_z, and stand. These variables are useful in distinguishing between pitch types because they determine the behavior of a given pitch. We then made spin rate numeric, removed pitches that were classified as an Eephus or Knuckleball from the data because they are scarcely thrown and were likely outliers, removed all pitches that were thrown from heights greater than 8 feet tall due to the implausibility of this being an accurate reading (all of these pitches were thrown by 6'1" pitcher Dylan Covey), and removed pitches that were thrown slower than 60 MPH. We also dropped observations of pitches delivered by position players because they were almost certain to be of a lower caliber than those thrown by actual pitchers, thus deeming them likely to be outliers. Next, we omitted observations with missing values and grouped similar pitches Knuckle-Curve and Sinker into the Curveball and 2-Seam the categories, respectively. Finally, we split our cleaned dataset into four separate datasets, two training and two test datasets, for both lefties and righties, respectively, to account for the fact that movement profiles and their values are contingent upon pitcher handedness because this alters the direction in which different pitch types move.
+
+# **Motivation**
+#### As can be seen in the GIFs below, it can be extremely difficult to distinguish between pitch types, even for experts, just from looking at the pitches with the naked eye. The GIFs below show each pitch type for Mike Leake of the Arizona Diamondbacks, controlling for the venue (all pitches are from the Diamondbacks Home Stadium, Chase Field), camera angle, and batter handedness for consistency to demonstrate just how daunting a task it can be to differentiate. 
+
+## **Fastball**
+![](LeakeFastball.gif)
+
+## **Sinker**
+![](LeakeSinker.gif)
+
+## **Changeup**
+![](LeakeChangeup.gif)
+
+## **Cutter**
+![](LeakeCutter.gif)
+
+## **Slider**
+![](LeakeSlider.gif)
+
+## **Curveball**
+![](LeakeCurveball.gif)
+
+# **Goals of this Research**
+#### Some pitchers' pitch types are easier to distinguish than others without knowledge of the values of crucial variables like velocity, spin rate, and movement. Even having this information at their disposal, many commentators and fans at games are left wondering what a pitch actually was after seeing it, which our project seeks to resolve. What are the main distinguishing metrics between pitch types? What are the characteristics of each pitch type? Our analysis below seeks to answer these questions.
+
+```{r, echo = FALSE, warning= FALSE, message = FALSE}
+set.seed(253)
+pitch_type_split <- initial_split(may_all_cleaned, prop = .7)
+pitch_type_train <- training(pitch_type_split)
+pitch_type_test <- testing(pitch_type_split)
+
+set.seed(253)
+pitch_type_split_r <- initial_split(may_all_cleaned_r, prop = .7)
+pitch_type_train_r <- training(pitch_type_split_r)
+pitch_type_test_r <- testing(pitch_type_split_r)
+
+set.seed(253)
+pitch_type_split_l <- initial_split(may_all_cleaned_l, prop = .7)
+pitch_type_train_l <- training(pitch_type_split_l)
+pitch_type_test_l <- testing(pitch_type_split_l)
+```
+
+```{r, echo = FALSE, warning= FALSE, message = FALSE}
+model_stats <- function(data, lev = NULL, model = NULL) {
+  
+  stats <- defaultSummary(data, lev = lev, model = model)
+  
+  transf_rmse <- function (pred, obs) {
+    sqrt(mean((exp(obs) - exp(pred))^2))
+  }
+  
+  trmse <- transf_rmse(pred = data$pred,
+                       obs = data$obs)
+  c(tRMSE = trmse, stats)
+}
+```
+
+```{r, echo = FALSE, warning= FALSE, message = FALSE}
+set.seed(253)
+
+km_pitchers_movement <- kmeans(x = pitch_type_train %>% select(pfx_x, pfx_z),
+                  centers = 6, #number of clusters
+                  nstart = 20 #see below,
+                
+)
+
+
+km_pitchers_movement_l <- kmeans(x = pitch_type_train_l %>% select(pfx_x, pfx_z),
+                  centers = 6, #number of clusters
+                  nstart = 20 #see below,
+                
+)
+
+km_pitchers_movement_r <- kmeans(x = pitch_type_train_r %>% select(pfx_x, pfx_z),
+                  centers = 6, #number of clusters
+                  nstart = 20 #see below,
+                
+)
+```
+
+# **Exploratory Plots**
+
+## Dataset Breakdowns
+
+### Pitcher Handedness
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+may_all_cleaned %>% 
+  rename(`Pitcher Throws` = p_throws) %>% 
+  ggplot(aes(x = `Pitcher Throws`, fill = `Pitcher Throws`)) + 
+  geom_bar() +
+  labs(x = "Pitcher Side", y = "Total Number of Pitches Thrown in May 2019 Dataset") +
+  ggtitle("Distribution of Pitches Thrown by Pitcher Handedness in May 2019 Dataset")
+```
+
+#### The bar plot above exhibits the breakdown of pitches thrown in May 2019 by pitcher handedness. Using this graphic, it becomes clear that an overwhelmingly larger number of pitchers were delivered by righties than lefties. 
+### Pitch Type Distribution
+
+```{r, echo = FALSE}
+may_all_cleaned %>% 
+  rename(`Pitch Name` = pitch_name) %>% 
+  ggplot(aes(x = `Pitch Name`, fill = `Pitch Name`)) +
+  geom_bar() +
+  coord_flip() +
+  labs(y = "Count") +
+  ggtitle("Distribution of Pitch Types in May 2019 MLB Dataset")
+```
+
+#### The plot above shows the distribution of each pitch type within the clean May 2019 Dataset. Unsuprisingly, 4-Seam Fastballs were the most commonly thrown pitch by a wide margin, with Slider, 2-Seam Fastball, Changeup, and Curveball trailing behind. Cutters and Split-Finger Fastballs were the least commonly thrown pitches within the data.
+## Clustering
+
+```{r, echo = FALSE}
+augment(km_pitchers_movement_l, data = pitch_type_train_l) %>% 
+  ggplot(aes(x= pfx_x, y= pfx_z, 
+             color= .cluster)) +
+  geom_point() +
+  labs(x = "Horizontal Movement (in.)", y = "Vertical Movement (in.)") +
+  ggtitle("Pitch Clusters for Left-Handed Pitcher (Using Just Movement)")
+```
+
+```{r, echo = FALSE}
+augment(km_pitchers_movement_r, data = pitch_type_train_r) %>% 
+  ggplot(aes(x= pfx_x, y= pfx_z, 
+             color= .cluster)) +
+  geom_point() +
+  labs(x = "Horizontal Movement (in.)", y = "Vertical Movement (in.)") +
+  ggtitle("Pitch Clusters for Right-Handed Pitcher (Using Just Movement)")
+```
+
+## Top Three Pitches Within Each Cluster for LHP by %:
+
+### Cluster 1: 
+#####              82.22 % 4-Seam Fastball
+#####               9.23 % 2-Seam Fastball
+#####               4.56 % Changeup  
+
+### Cluster 2: 
+#####              56.66 % Slider
+#####              30.69 % Cutter
+#####               6.50 % Curveball 
+
+### Cluster 3: 
+#####              73.51 % Curveball
+#####              26.14 % Slider
+#####                .25 % Cutter 
+
+### Cluster 4: 
+#####              49.44 % 2-Seam Fastball
+#####              39.15 % Changeup
+#####              11.29 % 4-Seam Fastball
+
+## Top Three Pitches Within Each Cluster for RHP by %:
+
+### Cluster 1: 
+#####              51.84  % 2-Seam Fastball
+#####              33.47  % Changeup
+#####               9.35  % 4-Seam Fastball  
+
+### Cluster 2: 
+#####              74.42 % Curveball
+#####              24.79 % Slider
+#####                .73 % Cutter
+
+### Cluster 3: 
+#####              89.91 % 4-Seam Fastball
+#####               4.91 % 2-Seam
+#####               3.08 % Changeup
+
+### Cluster 4: 
+#####              66.75 % Slider
+#####              23.32 % Cutter
+#####               4.35 % Curveball
+
+
+#### The clusters above are created by only looking at the vertical and horizontal movement of each pitch. As you can see from the percentages of what pitch is in each cluster, just using the movement is not a great way to predict what pitch it is because many of the clusters were quite heterogeneous, signifying that many different pitch types were grouped in together. This clustering process simulated what the naked eye does when watching a game. As a result, we concluded that we needed to add other predictors such as spin rate and velocity, among other variables, to create a more accurate model that can actually be useful for a broadcaster or fans.
+
+
+## Examining Variables of Interest
+
+```{r, echo=FALSE, warning = FALSE, message = FALSE}
+may_all_cleaned_kable <- may_all_cleaned %>%
+  group_by(pitch_type) %>%
+  summarise(avg_extension = mean(release_pos_y)) %>%
+  arrange(avg_extension) %>% 
+  rename(`Pitch Type` = pitch_type, `Average Extension (in)` = avg_extension)
+
+kable(may_all_cleaned_kable, caption = "Average Extension in May 2019 Dataset by Pitch Type") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+#### The table above exhibits that for any given pitch type, the average extension on the pitch will be essentially the same, as the differences between the average extension for each pitch type were nearly identical, meaning this will not serve as a meaningful predictor in our models.
+
+
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+may_all_cleaned %>%
+    group_by(player_name, pitch_type) %>%
+    rename(`Pitch Name` = pitch_name) %>% 
+    ggplot(aes(x = release_pos_x, y = release_pos_z, color = `Pitch Name`)) +
+    geom_point() +
+    labs(x = "Horizontal Release Point Relative to Home Plate (in)", y = "Vertical Release Point Relative to Home Plate (in)") +
+    ggtitle("Release Points by Pitch Type") + 
+    theme(text = element_text(size=20))
+```
+
+
+#### The plot above shows us the release position from the home plate view of each pitch thrown in the MLB in May 2019. We can see that there is not enough of a difference to be able to use this to predict pitch type, at least not without using many other predictors. Due to the variance in mechanics from pitcher-to-pitcher, nearly each pitch is thrown from every potential arm angle. 
+
+
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+may_all_cleaned %>% 
+  group_by(player_name, pitch_type) %>% 
+  mutate(AvgVelo = mean(release_speed)) %>% 
+  filter(pitch_type %in% c("FC", "FF", "FT", "SI")) %>% 
+  ggplot(aes(x = release_spin_rate, y = release_speed, color = pitch_name)) + 
+  geom_point() +
+  labs(x = "Spin Rate (RPM)", y = "Velocity (MPH)") +
+  ggtitle("Velocity by Spin Rate for Different Types of Fastballs") +
+  theme(text = element_text(size=20))
+```
+
+
+#### The plot above shows the spin rate and velocity for all types of fastballs (Cutter, 4-Seam, Two-Seam). Cutters tend to have higher spin and lower velocity than the other two kind, 2-Seam Fastballs tend to have lower spin and the widest range of velocity, while 4-Seam Fastballs are typically accompanied by a higher velocity. 
+
+
+```{r, echo = FALSE}
+may_all_cleaned %>%
+    group_by(player_name, pitch_type) %>%
+    mutate(AvgVelo = mean(release_speed)) %>%
+    ggplot(aes(x = pitch_name, y = AvgVelo)) +
+    geom_boxplot() +
+    labs(x = "Pitch Type", y = "Average Velocity (MPH)") +
+    ggtitle("Velocity by Pitch Type for MLB Pitchers in May 2019")
+```
+
+#### The plot above shows the average velocity range of each pitch and the substantial difference between pitch types demonstrates that this variable is likely to be a useful predictor in our models. 
+
+
+
+# Modeling Using Training Data
+
+## Small Tree
+
+```{r, echo = FALSE, output = FALSE, warning = FALSE}
+set.seed(253)
+pitch_tree_r <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_r %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rpart",
+  tuneGrid = data.frame(cp = .005),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+
+set.seed(253)
+pitch_tree_l <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_l %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rpart",
+  tuneGrid = data.frame(cp = .005),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+
+```
+
+### Results of the Small Tree for LHP
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+kable(pitch_tree_l$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Results of the Small Tree for RHP
+
+```{r, echo = FALSE}
+kable(pitch_tree_r$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Small Tree Visualization for LHP
+
+```{r echo = FALSE, warning = FALSE}
+rpart.plot(pitch_tree_l$finalModel, tweak = 1)
+```
+
+### Small Tree Visualization for RHP
+
+```{r, echo = FALSE, warning= FALSE}
+rpart.plot(pitch_tree_r$finalModel, tweak = 1)
+```
+
+#### These basic trees use each predictor in our training dataset, except for pitch name, player name, batter handedness, home score, away score, as inputs for decision trees. We choose a complexity parameter that doesn't yield the highest accuracy, sacrificing accuracy for the superior interpretability of the tree that stems from this cp. We can use this to better understand how the models are predicting what pitch is being thrown.The accuracies are listed above.
+
+## Large Tree
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+set.seed(253)
+pitch_type_tree_l <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_l %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name, -p_throws), 
+  method = "rpart",
+  trControl = trainControl(method = "cv", 
+                           number = 5),
+  tuneGrid = data.frame(cp = 4e-05),
+  na.action = na.omit
+)
+
+set.seed(253)
+pitch_type_tree_r <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_r %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name, -p_throws), 
+  method = "rpart",
+  trControl = trainControl(method = "cv", 
+                           number = 5),
+  tuneGrid = data.frame(cp = 4e-05),
+  na.action = na.omit
+)
+```
+
+
+```{r, echo = FALSE}
+set.seed(253)
+pitch_tree_grid_r <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_r %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name, -p_throws), 
+  method = "rpart",
+  trControl = trainControl(method = "cv", 
+                           number = 5),
+  tuneGrid = data.frame(cp = seq(0, 7e-05, length = 25)),
+  na.action = na.omit
+)
+
+set.seed(253)
+pitch_tree_grid_l <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_l %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name, -p_throws), 
+  method = "rpart",
+  trControl = trainControl(method = "cv", 
+                           number = 5),
+  tuneGrid = data.frame(cp = seq(0, 7e-05, length = 25)),
+  na.action = na.omit
+)
+
+
+```
+
+```{r, echo = FALSE}
+pitch_tree_grid_l %>%
+  ggplot(aes(x = cp, y = RMSE)) +
+  ggtitle("Pitch Type Accuracies for Decision Tree Model on LHP")
+
+pitch_tree_grid_r %>%
+  ggplot(aes(x = cp, y = RMSE)) +
+  ggtitle("Pitch Type Accuracies for Decision Tree Model on RHP")
+```
+
+#### Based on the graphs above of the accuracies for different complexity parameters, we decided to choose a cp of 4e-05 for each model (to maintain consistency) and avoid overfitting the data to the training data. There are jumps in the accuracies for complexity parameters that are slightly greater than 4e-05 for both LHP and RHP, so we use a cp slightly lower than these jumps to ensure that the training data doesn't sway the model too much. 
+
+### Results of the Large Tree for LHP
+
+```{r, echo = FALSE, output = FALSE, warning = FALSE}
+kable(pitch_type_tree_l$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Results of the Large Tree for RHP
+
+```{r, echo = FALSE, output = FALSE, warning = FALSE}
+kable(pitch_type_tree_r$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+#### These decision trees have the same inputs as the more basic tree except it uses the best complexity parameter for cross-validated accuracy. This would be better to use for actually predicting than the smaller tree, but the actual trees for this complexity parameter are much too busy to look at. The accuracies are listed above.
+
+## KNN Model
+
+```{r,echo= FALSE, warning = FALSE, message = FALSE}
+set.seed(253)
+pitch_type_knn_l <- train(
+  pitch_type ~ scale(release_speed) + scale(release_spin_rate) + scale(pfx_x) + scale(pfx_z), 
+  data = pitch_type_train_l %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = 10) 
+)
+
+set.seed(253)
+pitch_type_knn_r <- train(
+  pitch_type ~ scale(release_speed) + scale(release_spin_rate) + scale(pfx_x) + scale(pfx_z), 
+  data = pitch_type_train_r %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = 10) 
+)
+```
+
+
+```{r,echo= FALSE, warning = FALSE, message = FALSE}
+set.seed(253)
+pitch_type_best_number_knn_l <- train(
+  pitch_type ~ scale(release_speed) + scale(release_spin_rate) + scale(pfx_x) + scale(pfx_z), 
+  data = pitch_type_train_l %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = seq(5, 25, length = 5)) 
+)
+
+set.seed(253)
+pitch_type_best_number_knn_r <- train(
+  pitch_type ~ scale(release_speed) + scale(release_spin_rate) + scale(pfx_x) + scale(pfx_z), 
+  data = pitch_type_train_r %>% select(-stand, -home_score, -away_score, -pitch_name, -player_name), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = seq(5, 25, length = 5)) 
+)
+```
+
+```{r, echo = FALSE}
+pitch_type_best_number_knn_l %>%
+  ggplot(aes(x = k, y = RMSE)) +
+  ggtitle("Pitch Type Accuracies for Decision Tree Model on LHP")
+
+pitch_type_best_number_knn_r %>%
+  ggplot(aes(x = cp, y = RMSE)) +
+  ggtitle("Pitch Type Accuracies for Decision Tree Model on RHP")
+```
+
+#### When deciding the optimal number of neighbors to use in our models, we prioritized high accuracy, while minimizing the total number of neighbors used, to maintain the simplicity of the model. As a result, our final models use 10 neighbors. 
+
+### Results of KNN Model for LHP
+
+```{r, echo = FALSE}
+kable(pitch_type_knn_l$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Results of KNN Model for RHP
+
+```{r, echo = FALSE}
+kable(pitch_type_knn_r$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Random Forest
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+pitch_type_bagging_l <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_l %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws), 
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100,
+  importance = TRUE, 
+  nodesize = 5, 
+  na.action = na.omit
+)
+
+pitch_type_bagging_r <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_r %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws), 
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100, #number of trees used, default is 500
+  importance = TRUE, #for importance plots later
+  nodesize = 5, #this is the default terminal node size for regression trees. Could set larger for smaller trees.
+  na.action = na.omit
+)
+```
+
+```{r, echo = FALSE}
+pitch_type_bagging_l <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_l %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws), 
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100,
+  importance = TRUE, 
+  nodesize = 5, 
+  na.action = na.omit
+)
+
+pitch_type_bagging_r <- train(
+  pitch_type ~ .,
+  data = pitch_type_train_r %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws), 
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100, #number of trees used, default is 500
+  importance = TRUE, #for importance plots later
+  nodesize = 5, #this is the default terminal node size for regression trees. Could set larger for smaller trees.
+  na.action = na.omit
+)
+```
+
+#### Knowing the long processing time of running a random forest model, we only include our final model (mtry = 6) in this code, but we found that this value for mtry was the one that yielded the combination of most accurate results and minimized the chances of overfitting.
+
+
+### Results of Random Forest Model for LHP
+
+```{r, echo = FALSE}
+kable(pitch_type_bagging_l$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Results of Random Forest Model for RHP
+
+```{r, echo = FALSE}
+kable(pitch_type_bagging_r$results) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+#### After running each of the models on the testing data for both LHP and RHP, it appears as though the random forest model is the most accurate one for predicting pitch types. However, to ensure that the model wasn't overfit on the training datasets, we need to run each of the models on the testing datasets as well.
+
+# Testing the Models
+
+### Testing Results of Small Tree for LHP
+
+```{r, echo = FALSE}
+pitch_type_small_test_l <- pitch_type_test_l %>% 
+  mutate(Predicted = predict(pitch_tree_l, pitch_type_test_l)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+pitch_type_small_test_l <- formattable(pitch_type_small_test_l[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(pitch_type_small_test_l, caption = "Test Data Accuracy for Small Decision Tree Model for RHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+### Testing Results of Small Tree for RHP
+
+```{r, echo = FALSE}
+pitch_type_small_test_r <- pitch_type_test_r %>% 
+  mutate(Predicted = predict(pitch_tree_r, pitch_type_test_r)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+pitch_type_small_test_r <- formattable(pitch_type_small_test_r[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(pitch_type_small_test_r, caption = "Test Data Accuracy for Small Decision Tree Model for RHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+### Testing Results of Large Tree for LHP
+
+```{r, echo = FALSE}
+tree_lhp_test <- pitch_type_test_l %>% 
+  mutate(Predicted = predict(pitch_type_tree_l, pitch_type_test_l)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+tree_lhp_test <- formattable(tree_lhp_test[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(tree_lhp_test, caption = "Test Data Accuracy for Decision Tree Model for LHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+
+### Testing Results of Large Tree for RHP
+
+```{r, echo = FALSE}
+tree_rhp_test <- pitch_type_test_r %>% 
+  mutate(Predicted = predict(pitch_type_tree_r, pitch_type_test_r)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+tree_rhp_test <- formattable(tree_rhp_test[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(tree_rhp_test, caption = "Test Data Accuracy for Decision Tree Model for RHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+### Testing Results of KNN for LHP
+
+```{r, echo = FALSE}
+knn_lhp_test <- pitch_type_test_l %>% 
+  mutate(Predicted = predict(pitch_type_knn_l, pitch_type_test_l)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+knn_lhp_test <- formattable(knn_lhp_test[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(knn_lhp_test, caption = "Test Data Accuracy for KNN Model for LHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+
+### Testing Results of KNN for RHP
+
+```{r, echo = FALSE}
+knn_rhp_test <- pitch_type_test_r %>% 
+  mutate(Predicted = predict(pitch_type_knn_r, pitch_type_test_r)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+knn_rhp_test <- formattable(knn_rhp_test[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(knn_rhp_test, caption = "Test Data Accuracy for KNN Model for RHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+### Testing Results of Random Forest for LHP
+
+```{r, echo = FALSE}
+rf_lhp_test <- pitch_type_test_l %>% 
+  mutate(Predicted = predict(pitch_type_bagging_l, pitch_type_test_l)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+rf_lhp_test <- formattable(rf_lhp_test[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(rf_lhp_test, caption = "Test Data Accuracy for Random Forest Model for LHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white") 
+```
+
+### Testing Results of Random Forest for RHP
+
+```{r, echo = FALSE}
+rf_rhp_test <- pitch_type_test_r %>% 
+  mutate(Predicted = predict(pitch_type_bagging_r, pitch_type_test_r)) %>% 
+  mutate(Count = n()) %>% 
+  filter(Predicted == pitch_type) %>% 
+  mutate(Correct = n(), PCT = Correct/Count) %>% 
+  distinct(PCT)
+```
+
+```{r, echo = FALSE}
+rf_rhp_test <- formattable(rf_rhp_test[1:1, 1:1], color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(rf_rhp_test, caption = "Test Data Accuracy for Random Forest Model for RHP", align = "l") %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white") 
+```
+
+
+#### As you can see from this test data, the random forest is clearly the most accurate model for predicting pitch types because it has both the best training and testing accuracy. As a result, we would use this as our go-to model for making predictions.
+
+# Models in Real-Time Action
+
+### Applying Our Best Model to Specific Pitches
+
+#### Below we have randomly selected a handful of pitches from within the dataset. Looking at the GIFs of these pitches in combination with the variables of interest from the modeling, we applied our best random forest to make pitch type predictions (as it would do if we were using it to guess pitch types in real time)! The results are below:
+
+## **Jordan Hicks 2-Seam Fastball**
+![](Hicks2Seam.gif)
+
+```{r, echo = FALSE}
+hicks_ft_tree_prob <- 
+  pitch_type_train_r %>% 
+  mutate(Prediction = predict(pitch_type_bagging_r$finalModel)) %>%
+  filter(pitch_name == "2-Seam Fastball", player_name == "Jordan Hicks", release_speed == 103.7, stand == "L") %>% 
+  rename(Pitcher = player_name, Velocity = release_speed, `Spin Rate` = release_spin_rate, `Pitch Type` = pitch_type, `Horizontal Movement` = pfx_x, `Vertical Movement` = pfx_z) %>% 
+  select(Pitcher, `Pitch Type`, Prediction, Velocity, `Spin Rate`, `Horizontal Movement`, `Vertical Movement`)
+```
+
+```{r, echo = FALSE}
+hicks_table <- formattable(hicks_ft_tree_prob[1:1, 1:7], caption = "Prediction of Jordan Hicks Pitch Above", color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(hicks_table) %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white") #%>% 
+```
+
+
+## **Rich Hill Curveball**
+![](HillCurveball.gif)
+
+```{r, echo = FALSE}
+hill_cu_tree_prob <- pitch_type_train_l %>% 
+  mutate(Prediction = predict(pitch_type_bagging_l$finalModel)) %>%
+  filter(pitch_name == "Curveball", player_name == "Rich Hill", release_speed == 73.6, stand == "L") %>% 
+  rename(Pitcher = player_name, Velocity = release_speed, `Spin Rate` = release_spin_rate, `Pitch Type` = pitch_type, `Horizontal Movement` = pfx_x, `Vertical Movement` = pfx_z) %>% 
+  select(Pitcher, `Pitch Type`, Prediction, Velocity, `Spin Rate`, `Horizontal Movement`, `Vertical Movement`)
+```
+
+
+```{r, echo = FALSE}
+hill_table <- formattable(hill_cu_tree_prob[1:1, 1:7], caption = "Prediction of Rich Hill Pitch Above", color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(hill_table) %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+
+## **Luis Castillo Changeup**
+![](CastilloChangeup.gif)
+
+
+```{r, echo = FALSE}
+castillo_ch_tree_prob <- 
+  pitch_type_train_r %>% 
+  mutate(Prediction = predict(pitch_type_bagging_r$finalModel)) %>%
+  filter(pitch_name == "Changeup", player_name == "Luis Castillo", release_speed == 87.3, stand == "L", away_score == 2) %>% 
+  rename(Pitcher = player_name, Velocity = release_speed, `Spin Rate` = release_spin_rate, `Pitch Type` = pitch_type, `Horizontal Movement` = pfx_x, `Vertical Movement` = pfx_z) %>% 
+  select(Pitcher, `Pitch Type`, Prediction, Velocity, `Spin Rate`, `Horizontal Movement`, `Vertical Movement`)
+```
+
+```{r, echo = FALSE}
+castillo_table <- formattable(castillo_ch_tree_prob[1:1, 1:7], caption = "Prediction of Luis Castillo Pitch Above", color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(castillo_table) %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+
+## **Chaz Roe Slider**
+![](RoeSlider.gif)
+
+
+```{r, echo = FALSE}
+roe_sl_tree_prob <- 
+  pitch_type_train_r %>% 
+  mutate(Prediction = predict(pitch_type_bagging_r$finalModel)) %>%
+  filter(pitch_name == "Slider", player_name == "Chaz Roe", release_speed == 79.3, stand == "R") %>% 
+  rename(Pitcher = player_name, Velocity = release_speed, `Spin Rate` = release_spin_rate, `Pitch Type` = pitch_type, `Horizontal Movement` = pfx_x, `Vertical Movement` = pfx_z) %>% 
+  select(Pitcher, `Pitch Type`, Prediction, Velocity, `Spin Rate`, `Horizontal Movement`, `Vertical Movement`)
+```
+
+```{r, echo = FALSE}
+roe_table <- formattable(roe_sl_tree_prob[1:1, 1:7], caption = "Prediction of Chaz Roe Pitch Above", color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(roe_table) %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+
+## **Oliver Drake Splitter**
+![](DrakeSplitter.gif)
+
+```{r, echo = FALSE}
+drake_fs_tree_prob <- 
+  pitch_type_train_r %>% 
+  mutate(Prediction = predict(pitch_type_bagging_r$finalModel)) %>% 
+  filter(pitch_type == "FS", player_name == "Oliver Drake", release_speed == 84.1, home_score == 1, away_score == 5, plate_z == 1.6924) %>% 
+  rename(Pitcher = player_name, Velocity = release_speed, `Spin Rate` = release_spin_rate, `Pitch Type` = pitch_type, `Horizontal Movement` = pfx_x, `Vertical Movement` = pfx_z) %>% 
+  select(Pitcher, `Pitch Type`, Prediction, Velocity, `Spin Rate`, `Horizontal Movement`, `Vertical Movement`)
+```
+
+```{r, echo = FALSE}
+drake_table <- formattable(drake_fs_tree_prob[1:1, 1:7], caption = "Prediction of Oliver Drake Pitch Above", color = "Black", list( `Venue` = formatter("span", style = ~ style(color = "black",font.weight = "bold"))))
+kable(drake_table) %>% 
+  kableExtra::kable_styling(full_width = TRUE) %>% 
+  kableExtra::row_spec(1, background = "white", color = "black") %>% 
+  kableExtra::row_spec(0, color = "black", background = "white")
+```
+
+# Conclusion
+
+#### In conclusion, we were able to determine that a Random Forest model, splitting the data into LHP and RHP, is the most effective method for predicting pitch types in real time, given the right data. It could be a very useful tool for broadcasters and fans alike at MLB ballparks. It could even be an especially valuable tool at lower levels of baseball, such as the Minor Leagues (MiLB) or collegiate level, where each pitcher's pitch types may be harder to decipher due to inferior velocity and the lack of prior knowledge on lower-level pitchers. If we were given more time to pursue this project, we would create an app that could be used in real time during games. 

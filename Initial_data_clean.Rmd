@@ -1,0 +1,528 @@
+---
+title: "Initial Data Clean"
+author: "Michael Helton"
+date: "4/23/2020"
+output: html_document
+---
+```{r Lib, echo=FALSE, message=FALSE}
+#plotting and exploring
+library(tidyverse)
+library(GGally)  
+library(ggridges) 
+library(corrplot) 
+library(naniar) 
+library(pdp) 
+library(rpart.plot) 
+library(vip) 
+library(pROC) 
+library(plotROC) 
+
+#making things look nice
+library(lubridate) 
+library(knitr) 
+library(scales) 
+library(gridExtra) 
+library(broom) 
+library(janitor) 
+
+#data
+library(ISLR) 
+library(moderndive) 
+library(rattle) 
+library(fivethirtyeight) 
+
+#modeling
+library(rsample) 
+library(recipes) 
+library(caret) 
+library(leaps) 
+library(glmnet) 
+library(earth) 
+library(rpart) 
+library(randomForest) 
+
+theme_set(theme_minimal())
+```
+
+```{r, message=FALSE}
+May_1.7_pitch <- read_csv("May_1-7_pitch.csv")
+May_8.14_pitch <- read_csv("May_8-14_pitch.csv")
+May_15.21_pitch <- read_csv("May_15-21_pitch.csv")
+May_22.28_pitch <- read_csv("May_22-28_pitch.csv")
+May_29.31_pitch_nofilter <- read_csv("May_29-31_pitch_nofilter.csv")
+```
+
+```{r}
+Pitch_2019_May <- rbind(May_1.7_pitch, May_8.14_pitch, May_15.21_pitch, May_22.28_pitch, May_29.31_pitch_nofilter)
+```
+
+```{r, message=FALSE}
+may_all_cleaned <- Pitch_2019_May %>%
+  select(pitch_type, release_speed, release_pos_x, release_pos_z, release_pos_y, player_name, p_throws, pfx_x, pfx_z, release_spin_rate, release_extension, home_score, away_score, pitch_name, plate_x, plate_z, stand) %>%
+  mutate(release_spin_rate = as.numeric(release_spin_rate)) %>%
+  filter(release_pos_z < 8, pitch_type != 'EP', pitch_type != "EP", release_pos_z < 8, !player_name %in% c("Chris Owings", "Hernan Perez", "Victor Caratini", "Brandon Dixon", "John Ryan Murphy", "Luke Maile", "Kevin Plawecki", 'Tyler White', 'Pat Venditte', 'Ryan Feierabend', 'Charlie Culberson', 'Tom Murphy', 'Pablo Sandoval'), release_speed > 60)
+
+may_all_cleaned <- na.omit(may_all_cleaned)
+
+may_all_cleaned$pitch_type[may_all_cleaned$pitch_type == "KC"] <- "CU"
+may_all_cleaned$pitch_type[may_all_cleaned$pitch_type == "SI"] <- "FT"
+may_all_cleaned$pitch_name[may_all_cleaned$pitch_name == "Knuckle Curve"] <- "Curveball"
+may_all_cleaned$pitch_name[may_all_cleaned$pitch_name == "Sinker"] <- "2-Seam Fastball"
+```
+
+```{r}
+may_all_cleaned %>%
+  group_by(pitch_type) %>%
+  summarise(avg_extension = mean(release_pos_y)) %>%
+  arrange(avg_extension)
+```
+
+```{r}
+max(may_all_cleaned$pfx_x)
+```
+
+```{r}
+min(may_all_cleaned$pfx_x)
+```
+
+
+```{r, fig.width=10}
+may_all_cleaned %>%
+  group_by(player_name, pitch_type) %>%
+  ggplot(aes(x = release_pos_x, y = release_pos_z, color = pitch_name)) +
+  geom_point()
+```
+
+Dylan Covey Rule
+  No release point over 8 feet. 
+
+```{r}
+may_all_cleaned %>%
+  ggplot(aes(x = p_throws, fill = pitch_name)) + 
+  geom_bar(position = 'fill')
+```
+
+```{r, fig.width=5}
+may_all_cleaned %>%
+  group_by(player_name, pitch_type) %>%
+  mutate(AvgVelo = mean(release_speed)) %>%
+  ggplot(aes(x = pitch_name, y = AvgVelo)) +
+  geom_boxplot()
+```
+
+
+```{r, fig.width=10}
+may_all_cleaned %>%
+  group_by(player_name, pitch_type) %>%
+  mutate(AvgVelo = mean(release_speed)) %>%
+  filter(pitch_type %in% c("FC", "FF", "FT", 'SI')) %>%
+  ggplot(aes(x = release_spin_rate, y = release_speed, color = pitch_name)) +
+  geom_point()
+```
+
+```{r, fig.width=10}
+may_all_cleaned %>%
+  group_by(player_name, pitch_type) %>%
+  filter(pitch_type %in% c("FC", "FF", "FT")) %>%
+  ggplot(aes(x = pfx_x, y = pfx_z, color = pitch_name)) + 
+  geom_point() + 
+  facet_wrap(~p_throws) + 
+  labs(title = "Home plate view of pitch movement compared to average (in inches)")
+```
+
+```{r, fig.width=10}
+may_all_cleaned %>%
+  group_by(player_name, pitch_type) %>%
+  ggplot(aes(x = pfx_x, y = pfx_z, color = pitch_name)) + 
+  geom_point() + 
+  facet_wrap(~p_throws) + 
+  labs(title = "Home plate view of pitch movement compared to average (in inches)")
+```
+
+
+```{r Pitch Plot, fig.width=10, fig.height=10}
+topKzone = 3.5
+botKzone = 1.6
+inKzone = -.95
+outKzone = 0.95
+kZone = data.frame(
+  x = c(inKzone, inKzone, outKzone, outKzone, inKzone)
+  , y = c(botKzone, topKzone, topKzone, botKzone, botKzone)
+)
+may_all_cleaned %>%
+  group_by(player_name, pitch_type) %>%
+  mutate(AverageVelocity = mean(release_speed, na.rm = TRUE), AverageSpinRate = mean(release_spin_rate, na.rm = TRUE)) %>%
+  ungroup() %>%
+  select(player_name, pitch_name, release_speed, release_spin_rate, stand, plate_x, plate_z) %>%
+  filter(player_name == "Max Scherzer") %>%
+  ggplot() +
+    geom_point(aes(x = plate_x, y = plate_z, color = pitch_name), shape = 20) +
+    facet_grid(~ stand) +
+    coord_equal() +
+    geom_path(aes(x,y), kZone, lwd = 2, col = "red", alpha = .4) +
+    scale_x_reverse(name="Horizontal Distance From Center of the Plate (Inches)", limits=c(3, -3)) +
+    scale_y_continuous(name="Vertical Distance From Center of the Plate (Inches)", limits=c(0, 5)) +
+    theme_linedraw() +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+
+```{r}
+set.seed(253)
+may_all_cleaned_L <- may_all_cleaned %>%
+  filter(p_throws == "L")
+
+may_all_cleaned_R <- may_all_cleaned %>%
+  filter(p_throws == "R")
+
+pitch_split <- may_all_cleaned %>% 
+  initial_split(prop = .7)
+
+pitch_train <- training(pitch_split)
+pitch_test <- testing(pitch_split)
+```
+
+```{r}
+set.seed(253)
+
+pitch_tree_large <- train(
+  pitch_type ~ .,
+  data = pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score),
+  method = "rpart",
+  tuneGrid = data.frame(cp = 4.685070e-05),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+```
+
+```{r}
+pitch_tree_large$results
+```
+
+```{r}
+pitch_train %>%
+  bind_cols(as.data.frame(predict(pitch_tree_large$finalModel)))
+```
+
+
+```{r, fig.width=15}
+rpart.plot(pitch_tree_large$finalModel, box.palette=0)
+```
+
+```{r}
+set.seed(253)
+
+pitch_tree <- train(
+  pitch_type ~ .,
+  data = pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score),
+  method = "rpart",
+  tuneGrid = data.frame(cp = .005),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+```
+
+```{r}
+pitch_tree$results
+```
+
+```{r, fig.width=15}
+rpart.plot(pitch_tree$finalModel, box.palette=0)
+```
+
+```{r}
+pitch_train %>%
+  bind_cols(as.data.frame(predict(pitch_tree$finalModel)))
+```
+
+
+```{r}
+set.seed(253)
+
+pitch_knn <- train(
+  pitch_type ~ scale(pfx_x) + scale(pfx_z) + scale(release_speed) + scale(release_spin_rate), 
+  data = pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = c(5, 10, 15, 25)))
+```
+
+```{r}
+pitch_knn$results
+```
+
+```{r}
+pitch_knn_test <- train(
+  pitch_type ~ scale(pfx_x) + scale(pfx_z) + scale(release_speed) + scale(release_spin_rate) + as.factor(p_throws), 
+  data = pitch_test %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = c(10, 25)))
+```
+
+```{r}
+pitch_knn_test$results
+```
+
+```{r}
+set.seed(253)
+
+pitch_the_randomest_of_forests <- train(
+  pitch_type ~ .,
+  data = pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score),
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100, 
+  importance = TRUE, 
+  nodesize = 5, 
+  na.action = na.omit
+)
+```
+
+```{r}
+pitch_the_randomest_of_forests$results
+```
+
+```{r}
+km_pitch <- kmeans(x = pitch_train %>% select(pfx_x, pfx_z, release_speed, release_spin_rate) %>% scale(),
+                  centers = 6, 
+                  nstart = 20 )
+```
+
+```{r, fig.width=10, fig.height=10}
+augment(km_pitch, data = pitch_train) %>% 
+  ggplot(aes(x=pfx_x, y=pfx_z, 
+             color=pitch_type, shape=.cluster)) +
+  geom_point()
+```
+-------------------------------------------------------------------------------------------------
+Left
+```{r}
+L_pitch_split <- may_all_cleaned_L %>% 
+  initial_split(prop = .7)
+
+L_pitch_train <- training(L_pitch_split)
+L_pitch_test <- testing(L_pitch_split)
+```
+
+
+```{r}
+set.seed(253)
+pitch_tree_large_Left <- train(
+  pitch_type ~ .,
+  data = L_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rpart",
+  tuneGrid = data.frame(cp = 4.685070e-05),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+```
+
+```{r}
+pitch_tree_large_Left$results
+```
+
+```{r}
+L_pitch_train %>%
+  bind_cols(as.data.frame(predict(pitch_tree_large_Left$finalModel)))
+```
+
+
+```{r, fig.width=15}
+rpart.plot(pitch_tree_large$finalModel, box.palette=0)
+```
+
+```{r}
+set.seed(253)
+
+pitch_tree_Left <- train(
+  pitch_type ~ .,
+  data = L_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rpart",
+  tuneGrid = data.frame(cp = .005),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+```
+
+```{r}
+pitch_tree_Left$results
+```
+
+```{r, fig.width=15}
+rpart.plot(pitch_tree_Left$finalModel, box.palette=0)
+```
+
+
+
+```{r}
+set.seed(253)
+
+pitch_knn_Left <- train(
+  pitch_type ~ scale(pfx_x) + scale(pfx_z) + scale(release_speed) + scale(release_spin_rate), 
+  data = L_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = c(5, 10, 15, 25)))
+```
+
+```{r}
+pitch_knn_Left$results
+```
+
+
+```{r}
+set.seed(253)
+
+pitch_the_randomest_of_forests_Left <- train(
+  pitch_type ~ .,
+  data = L_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100, 
+  importance = TRUE, 
+  nodesize = 5, 
+  na.action = na.omit
+)
+```
+
+```{r}
+pitch_the_randomest_of_forests_Left$results
+```
+
+```{r}
+km_pitch_Left <- kmeans(x = L_pitch_train %>% select(pfx_x, pfx_z, release_speed, release_spin_rate) %>% scale(),
+                  centers = 6, 
+                  nstart = 20 )
+```
+
+```{r}
+augment(km_pitch_Left, data = L_pitch_train) %>% 
+  ggplot(aes(x=pfx_x, y=pfx_z, 
+             color=.cluster)) +
+  geom_point()
+```
+
+--------------------------------------------------------------------------------------------------------------
+
+Right
+```{r}
+R_pitch_split <- may_all_cleaned_R %>% 
+  initial_split(prop = .7)
+
+R_pitch_train <- training(R_pitch_split)
+R_pitch_test <- testing(R_pitch_split)
+```
+
+
+```{r}
+set.seed(253)
+pitch_tree_large_Right <- train(
+  pitch_type ~ .,
+  data = R_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rpart",
+  tuneGrid = data.frame(cp = 4.685070e-05),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+```
+
+```{r}
+pitch_tree_large_Right$results
+```
+
+```{r}
+R_pitch_train %>%
+  bind_cols(as.data.frame(predict(pitch_tree_large_Right$finalModel)))
+```
+
+
+```{r, fig.width=15}
+rpart.plot(pitch_tree_large_Right$finalModel, box.palette=0)
+```
+
+```{r}
+set.seed(253)
+
+pitch_tree_Right <- train(
+  pitch_type ~ .,
+  data = R_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rpart",
+  tuneGrid = data.frame(cp = .005),
+  trControl = trainControl(method = "cv", number = 5),
+  metric = "Accuracy",
+  na.action = na.omit)
+```
+
+```{r}
+pitch_tree_Right$results
+```
+
+```{r, fig.width=15}
+rpart.plot(pitch_tree_Right$finalModel, box.palette=0)
+```
+
+
+
+```{r}
+set.seed(253)
+
+pitch_knn_Right <- train(
+  pitch_type ~ scale(pfx_x) + scale(pfx_z) + scale(release_speed) + scale(release_spin_rate), 
+  data = R_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws), 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 5), 
+  tuneGrid = data.frame(k = c(5, 10, 15, 25)))
+```
+
+```{r}
+pitch_knn_Right$results
+```
+
+
+```{r}
+set.seed(253)
+
+pitch_the_randomest_of_forests_Right <- train(
+  pitch_type ~ .,
+  data = R_pitch_train %>% select(-pitch_name, -player_name, -stand, -away_score, -home_score, -p_throws),
+  method = "rf",
+  trControl = trainControl(method = "oob"),
+  tuneGrid = data.frame(mtry = 6),
+  ntree = 100, 
+  importance = TRUE, 
+  nodesize = 5, 
+  na.action = na.omit
+)
+```
+
+```{r}
+pitch_the_randomest_of_forests_Right$results
+```
+
+```{r}
+km_pitch_Right <- kmeans(x = R_pitch_train %>% select(pfx_x, pfx_z, release_speed, release_spin_rate) %>% scale(),
+                  centers = 6, 
+                  nstart = 20 )
+```
+
+```{r}
+augment(km_pitch_Right, data = R_pitch_train) %>% 
+  ggplot(aes(x=pfx_x, y=pfx_z, 
+             color=.cluster)) +
+  geom_point()
+```
+
+--------------------------------------------------------------------------------------------------------------
+Right Test
+```{r}
+pitch_the_randomest_of_forests_Right$finalModel
+```
+
+```{r}
+may_all_cleaned %>%
+  filter(pitch_type == 'FC') %>%
+  arrange(desc(release_spin_rate))
+```
